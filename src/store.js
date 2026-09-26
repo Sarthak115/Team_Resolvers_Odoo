@@ -116,7 +116,7 @@ async function refreshAfterMutation() {
 }
 export async function loadAvailability(productId, locationId) {
   if (!productId || !locationId) return;
-  const value = checked(await client().rpc('get_free_stock', { product_id: productId, location_id: locationId }), 'Could not check available stock');
+  const value = checked(await client().rpc('get_free_stock', { p_product_id: productId, p_location_id: locationId }), 'Could not check available stock');
   if (value === null || !Number.isFinite(Number(value))) throw new Error('The free-stock function did not return a quantity.');
   availability.set(`${productId}:${locationId}`, Number(value));
   return Number(value);
@@ -204,7 +204,7 @@ export async function saveOperation(type, fields, lines, existing) {
   return operation;
 }
 async function operationRpc(name, operationId) {
-  checked(await client().rpc(name, { operation_id: operationId }), 'Operation failed');
+  checked(await client().rpc(name, { p_operation_id: operationId }), 'Operation failed');
   await refreshAfterMutation();
   return checked(await client().from('inventory_operations').select('*').eq('id', operationId).single(), 'Operation updated but could not reload its status');
 }
