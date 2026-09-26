@@ -1,82 +1,216 @@
-const now = () => new Date().toISOString();
-export const uuid = () => crypto.randomUUID();
-const ids = {};
-const id = key => ids[key] ||= uuid();
-const date = offset => { const d = new Date(); d.setDate(d.getDate() + offset); return d.toISOString().slice(0,10); };
-function seed() {
-  const created_at = now();
-  const db = { profiles: [{id:id('manager'),full_name:'Alex Morgan',email:'alex@stocksense.demo',role:'manager',created_at}], categories:['Furniture','Raw Materials','Equipment'].map(name=>({id:id(name),name,created_at})), products:[], warehouses:[], locations:[], contacts:[], inventory_balances:[], inventory_operations:[], inventory_operation_items:[], stock_movements:[] };
-  db.warehouses = [['WH','Main Warehouse','Bhubaneswar, Odisha'],['WH2','Secondary Warehouse','Cuttack, Odisha']].map(([short_code,name,address])=>({id:id(short_code),name,short_code,address,created_at}));
-  db.locations = [['stock','WH/Stock','STOCK','WH','internal'],['rack','WH/Rack A','RACK-A','WH','internal'],['production','WH/Production','PROD','WH','internal'],['stock2','WH2/Stock','STOCK','WH2','internal'],['vendor','Vendor','VEN',null,'supplier'],['customer','Customer','CUS',null,'customer'],['adjustment','Inventory Adjustment','ADJ',null,'adjustment']].map(([key,name,short_code,wh,type])=>({id:id(key),warehouse_id:wh?id(wh):null,name,short_code,type,created_at}));
-  db.products = [['Desk','FUR-001','Furniture',3000,15,'Units'],['Table','FUR-002','Furniture',5000,10,'Units'],['Office Chair','FUR-003','Furniture',2400,20,'Units'],['Steel Rod','RAW-001','Raw Materials',850,100,'Units'],['Storage Rack','EQP-001','Equipment',7200,8,'Units'],['Monitor Stand','EQP-002','Equipment',1200,12,'Units'],['Filing Cabinet','FUR-004','Furniture',6800,5,'Units'],['Packing Tape','EQP-003','Equipment',120,25,'Rolls']].map(([name,sku,cat,cost,minimum_stock,unit])=>({id:id(name),name,sku,category_id:id(cat),unit,cost,minimum_stock,created_at,updated_at:created_at}));
-  db.contacts = [['Urban Furnishings','supplier','orders@urban.example','+91 674 250 1400','Bhubaneswar'],['Tata Steel Supplies','supplier','sales@tata.example','+91 657 242 5000','Jamshedpur'],['Azure Interiors','customer','hello@azure.example','+91 674 251 2200','Bhubaneswar'],['Nova Workspace','customer','team@nova.example','+91 671 240 1800','Cuttack']].map(([name,type,email,phone,address])=>({id:id(name),name,type,email,phone,address,created_at}));
-  [['Desk','stock',50],['Desk','rack',12],['Table','stock',30],['Office Chair','stock',16],['Office Chair','stock2',8],['Steel Rod','stock',80],['Steel Rod','production',15],['Storage Rack','stock',6],['Monitor Stand','rack',24],['Filing Cabinet','stock',14],['Packing Tape','stock',100]].forEach(([p,l,q])=>db.inventory_balances.push({id:uuid(),product_id:id(p),location_id:id(l),quantity_on_hand:q,reserved_quantity:0,updated_at:created_at}));
-  const add = (type,num,status,src,dst,contact,offset,lines) => {
-    const op={id:uuid(),reference:`WH/${{receipt:'IN',delivery:'OUT',transfer:'INT',adjustment:'ADJ'}[type]}/${String(num).padStart(4,'0')}`,operation_type:type,status,warehouse_id:id('WH'),source_location_id:id(src),destination_location_id:id(dst),contact_id:contact?id(contact):null,scheduled_date:date(offset),responsible_user_id:id('manager'),notes:'',created_by:id('manager'),created_at,completed_at:status==='done'?new Date(date(offset)+'T10:30:00').toISOString():null};
-    db.inventory_operations.push(op);
-    lines.forEach(([p,q])=>{const item={id:uuid(),operation_id:op.id,product_id:id(p),requested_quantity:q,reserved_quantity:status==='ready'&&type==='delivery'?q:0,done_quantity:status==='done'?q:0,created_at};db.inventory_operation_items.push(item);if(item.reserved_quantity)db.inventory_balances.find(b=>b.product_id===id(p)&&b.location_id===id(src)).reserved_quantity+=q;if(status==='done')db.stock_movements.push({id:uuid(),operation_id:op.id,operation_item_id:item.id,product_id:item.product_id,source_location_id:type==='adjustment'?op.destination_location_id:op.source_location_id,destination_location_id:type==='adjustment'?op.source_location_id:op.destination_location_id,quantity:type==='adjustment'?5:q,movement_type:type,created_at:op.completed_at,created_by:id('manager')});});
-  };
-  add('receipt',1,'ready','vendor','stock','Urban Furnishings',-2,[['Desk',20],['Office Chair',40]]);
-  add('receipt',2,'draft','vendor','stock','Tata Steel Supplies',2,[['Steel Rod',150]]);
-  add('receipt',3,'done','vendor','stock','Urban Furnishings',-5,[['Table',30],['Storage Rack',6]]);
-  add('receipt',4,'ready','vendor','rack','Urban Furnishings',0,[['Monitor Stand',12]]);
-  add('delivery',1,'ready','stock','customer','Azure Interiors',-1,[['Desk',5],['Table',4]]);
-  add('delivery',2,'waiting','stock','customer','Nova Workspace',0,[['Office Chair',30]]);
-  add('delivery',3,'draft','stock','customer','Azure Interiors',3,[['Storage Rack',2]]);
-  add('delivery',4,'done','stock','customer','Nova Workspace',-3,[['Desk',8],['Packing Tape',10]]);
-  add('transfer',1,'done','stock','rack',null,-4,[['Desk',12]]);
-  add('transfer',2,'draft','stock','stock2',null,1,[['Table',5]]);
-  add('adjustment',1,'done','adjustment','stock',null,-2,[['Steel Rod',80]]);
-  return db;
+import { supabase, configurationError } from './supabase.js';
+
+const tables = ['profiles', 'categories', 'products', 'warehouses', 'locations', 'contacts',
+  'inventory_balances', 'inventory_operations', 'inventory_operation_items', 'stock_movements',
+  'product_stock_summary', 'dashboard_metrics'];
+export const db = Object.fromEntries(tables.map(table => [table, []]));
+export const authState = { session: null, profile: null, recovery: false };
+export const availability = new Map();
+let loadVersion = 0;
+
+function client() {
+  if (!supabase) throw new Error(configurationError);
+  return supabase;
 }
-const KEY='stocksense-data-v1';
-export let db;
-try { db=JSON.parse(localStorage.getItem(KEY)) || seed(); } catch { db=seed(); }
-// Keep adjustment headers consistent: virtual adjustment location -> counted location.
-for (const op of db.inventory_operations) {
-  if (op.operation_type === 'adjustment' && db.locations.find(l => l.id === op.destination_location_id)?.type === 'adjustment') {
-    [op.source_location_id, op.destination_location_id] = [op.destination_location_id, op.source_location_id];
+function checked(result, context) {
+  if (result.error) {
+    const { code, message } = result.error;
+    if (code === '23505') throw new Error(`${context}: this record already exists (check its SKU or short code).`);
+    if (code === '42501') throw new Error(`${context}: your account does not have access. Check the existing RLS policies.`);
+    throw new Error(`${context}: ${message}`);
+  }
+  return result.data;
+}
+export const get = (table, key) => db[table].find(row => row.id === key);
+export const items = operation => db.inventory_operation_items.filter(item => item.operation_id === operation);
+export const idForType = type => db.locations.find(location => location.type === type)?.id;
+export const currentProfile = () => authState.profile;
+export const metrics = () => db.dashboard_metrics[0] || {};
+export const balance = (product, location) => db.inventory_balances.find(row =>
+  row.product_id === product && row.location_id === location) || { quantity_on_hand: 0, reserved_quantity: 0 };
+export function stock(product) {
+  const row = db.product_stock_summary.find(row => row.product_id === product);
+  return { on: Number(row?.quantity_on_hand ?? 0), reserved: Number(row?.reserved_quantity ?? 0),
+    free: Number(row?.free_to_use ?? 0) };
+}
+function clearData() {
+  loadVersion++;
+  tables.forEach(table => { db[table] = []; });
+  availability.clear();
+  authState.profile = null;
+}
+// Page through all records rather than silently truncating at the PostgREST row limit.
+async function readTable(table) {
+  const rows = [];
+  for (let offset = 0; ; offset += 1000) {
+    let query = client().from(table).select('*');
+    if (table === 'product_stock_summary') query = query.order('product_id');
+    else if (table !== 'dashboard_metrics') query = query.order('id');
+    const page = checked(await query.range(offset, offset + 999), `Could not load ${table.replaceAll('_', ' ')}`);
+    rows.push(...page);
+    if (page.length < 1000) return rows;
   }
 }
-export const persist=()=>localStorage.setItem(KEY,JSON.stringify(db));
-persist();
-export const get=(table,key)=>db[table].find(x=>x.id===key);
-export const items=op=>db.inventory_operation_items.filter(i=>i.operation_id===op);
-export function balance(product,location,create=false) { let b=db.inventory_balances.find(x=>x.product_id===product&&x.location_id===location);if(!b&&create){b={id:uuid(),product_id:product,location_id:location,quantity_on_hand:0,reserved_quantity:0,updated_at:now()};db.inventory_balances.push(b);}return b||{quantity_on_hand:0,reserved_quantity:0}; }
-export function stock(product) {const bs=db.inventory_balances.filter(b=>b.product_id===product&&get('locations',b.location_id)?.type==='internal');const on=bs.reduce((n,b)=>n+b.quantity_on_hand,0),reserved=bs.reduce((n,b)=>n+b.reserved_quantity,0);return{on,reserved,free:on-reserved};}
-export function saveProduct(data,existing) {
-  if(!data.name||!data.sku||!data.unit||!get('categories',data.category_id))throw Error('Name, SKU, category and unit are required.');
-  if([data.cost,data.minimum_stock,data.initial_stock].some(n=>!Number.isFinite(n)||n<0))throw Error('Cost and stock quantities must be valid nonnegative numbers.');
-  if(!existing&&data.initial_stock>0&&get('locations',data.location_id)?.type!=='internal')throw Error('Choose an internal location for initial stock.');
-  if(db.products.some(p=>p.sku.toLowerCase()===data.sku.toLowerCase()&&p.id!==existing))throw Error('A product with this SKU already exists.');
-  const {initial_stock,location_id,...fields}=data;
-  if(existing){Object.assign(get('products',existing),fields,{updated_at:now()});}else{const p={id:uuid(),...fields,created_at:now(),updated_at:now()};db.products.push(p);if(initial_stock>0){const op=saveOperation('adjustment',{source_location_id:idForType('adjustment'),destination_location_id:location_id,contact_id:null,scheduled_date:date(0),responsible_user_id:db.profiles[0].id,notes:'Initial stock'},[{product_id:p.id,requested_quantity:initial_stock}]);readyOperation(op.id);validateOperation(op.id);}existing=p.id;}persist();return existing;
+export async function refreshData() {
+  if (!authState.session) { clearData(); return; }
+  const version = ++loadVersion;
+  const userId = authState.session.user.id;
+  const results = await Promise.allSettled(tables.map(readTable));
+  if (version !== loadVersion || authState.session?.user.id !== userId) return;
+  const failed = results.find(result => result.status === 'rejected');
+  if (failed) throw failed.reason;
+  tables.forEach((table, index) => { db[table] = results[index].value; });
+  authState.profile = db.profiles.find(profile => profile.id === userId) || null;
+  availability.clear();
+  if (!authState.profile) throw new Error('Your profile is not available. Check the existing profile trigger and profiles read policy.');
 }
-export const idForType=type=>db.locations.find(l=>l.type===type)?.id;
-function checkFields(type,fields,lines){
-  if(!lines.length)throw Error('Add at least one product.');
-  if(new Set(lines.map(l=>l.product_id)).size!==lines.length)throw Error('Use one row per product; combine duplicate quantities.');
-  if(lines.some(l=>!get('products',l.product_id)||!Number.isFinite(l.requested_quantity)||l.requested_quantity<(type==='adjustment'?0:0.000001)))throw Error('Enter a valid quantity for each product.');
-  const src=get('locations',fields.source_location_id),dst=get('locations',fields.destination_location_id);
-  if(!src||!dst||src.id===dst.id)throw Error('Choose different source and destination locations.');
-  if(type==='receipt'&&(src.type!=='supplier'||dst.type!=='internal')||type==='delivery'&&(src.type!=='internal'||dst.type!=='customer')||type==='transfer'&&(src.type!=='internal'||dst.type!=='internal')||type==='adjustment'&&(src.type!=='adjustment'||dst.type!=='internal'))throw Error('Select valid locations for this operation.');
-  if(!fields.scheduled_date||!get('profiles',fields.responsible_user_id))throw Error('Scheduled date and responsible person are required.');
-  if(['receipt','delivery'].includes(type)&&!get('contacts',fields.contact_id))throw Error('Choose a contact.');
+export async function initializeSession() {
+  const { session } = checked(await client().auth.getSession(), 'Could not restore session');
+  authState.session = session;
+  if (session) await refreshData();
 }
-export function saveOperation(type,fields,lines,existing){
-  checkFields(type,fields,lines);
-  let op=existing?get('inventory_operations',existing):null;
-  if(op&&!['draft','waiting'].includes(op.status))throw Error('Only draft or waiting operations can be edited.');
-  if(!op){const warehouse=get('locations',type==='receipt'||type==='adjustment'?fields.destination_location_id:fields.source_location_id)?.warehouse_id;const code=get('warehouses',warehouse)?.short_code||'WH';const prefix=`${code}/${{receipt:'IN',delivery:'OUT',transfer:'INT',adjustment:'ADJ'}[type]}/`;const next=Math.max(0,...db.inventory_operations.filter(o=>o.reference.startsWith(prefix)).map(o=>Number(o.reference.split('/').at(-1))))+1;op={id:uuid(),reference:prefix+String(next).padStart(4,'0'),operation_type:type,status:'draft',warehouse_id:warehouse,...fields,created_by:db.profiles[0].id,created_at:now(),completed_at:null};db.inventory_operations.push(op);}else{Object.assign(op,fields,{status:'draft',warehouse_id:get('locations',type==='receipt'||type==='adjustment'?fields.destination_location_id:fields.source_location_id).warehouse_id});db.inventory_operation_items=db.inventory_operation_items.filter(i=>i.operation_id!==op.id);}
-  lines.forEach(line=>db.inventory_operation_items.push({id:uuid(),operation_id:op.id,product_id:line.product_id,requested_quantity:line.requested_quantity,reserved_quantity:0,done_quantity:0,created_at:now()}));persist();return op;
+// The callback holds the Auth lock: run dependent requests after it returns.
+if (supabase) supabase.auth.onAuthStateChange((event, session) => {
+  const changedUser = authState.session?.user.id !== session?.user.id;
+  authState.session = session;
+  if (event === 'PASSWORD_RECOVERY') authState.recovery = true;
+  if (!session || changedUser) clearData();
+  if (event === 'INITIAL_SESSION' || event === 'TOKEN_REFRESHED') return;
+  if (changedUser || event === 'PASSWORD_RECOVERY' || event === 'SIGNED_OUT') {
+    setTimeout(() => window.dispatchEvent(new CustomEvent('stocksense-session', { detail: event })), 0);
+  }
+});
+export async function signIn(email, password) {
+  const data = checked(await client().auth.signInWithPassword({ email, password }), 'Sign in failed');
+  authState.session = data.session;
+  await refreshData();
 }
-export function readyOperation(key){const op=get('inventory_operations',key);if(!op||!['draft','waiting'].includes(op.status))throw Error('This operation cannot be marked ready.');const ls=items(key);if(['delivery','transfer'].includes(op.operation_type)&&ls.some(i=>{const b=balance(i.product_id,op.source_location_id);return i.requested_quantity>b.quantity_on_hand-b.reserved_quantity;})){op.status='waiting';persist();return false;}
-  if(op.operation_type==='delivery')ls.forEach(i=>{const b=balance(i.product_id,op.source_location_id,true);b.reserved_quantity+=i.requested_quantity;b.updated_at=now();i.reserved_quantity=i.requested_quantity;});op.status='ready';persist();return true;
+export async function signUp(fullName, email, password) {
+  const data = checked(await client().auth.signUp({ email, password,
+    options: { data: { full_name: fullName }, emailRedirectTo: `${location.origin}/dashboard` } }), 'Sign up failed');
+  authState.session = data.session;
+  if (data.session) await refreshData();
+  return !!data.session;
 }
-export function cancelOperation(key){const op=get('inventory_operations',key);if(!op||['done','cancelled'].includes(op.status))throw Error('This operation is already closed.');items(key).forEach(i=>{if(i.reserved_quantity){const b=balance(i.product_id,op.source_location_id,true);b.reserved_quantity-=i.reserved_quantity;b.updated_at=now();i.reserved_quantity=0;}});op.status='cancelled';persist();}
-export function validateOperation(key){const op=get('inventory_operations',key);if(!op||op.status!=='ready')throw Error('Mark the operation Ready before validating.');const ls=items(key),type=op.operation_type;
-  for(const i of ls){const b=balance(i.product_id,op.source_location_id);if(['delivery','transfer'].includes(type)&&i.requested_quantity>b.quantity_on_hand-b.reserved_quantity+i.reserved_quantity)throw Error('Insufficient stock. Recheck availability after replenishment.');if(type==='adjustment'&&i.requested_quantity<balance(i.product_id,op.destination_location_id).reserved_quantity)throw Error('Physical count cannot be below reserved stock. Cancel the related delivery first.');}
-  const stamp=now();ls.forEach(i=>{let src=op.source_location_id,dst=op.destination_location_id,q=i.requested_quantity;
-    if(type==='adjustment'){const b=balance(i.product_id,dst,true),diff=q-b.quantity_on_hand;b.quantity_on_hand=q;b.updated_at=stamp;if(diff<0)[src,dst]=[dst,src];q=Math.abs(diff);}else{if(type!=='receipt'){const b=balance(i.product_id,src,true);b.quantity_on_hand-=q;b.reserved_quantity-=i.reserved_quantity;b.updated_at=stamp;}if(type!=='delivery'){const b=balance(i.product_id,dst,true);b.quantity_on_hand+=q;b.updated_at=stamp;}}
-    i.done_quantity=i.requested_quantity;i.reserved_quantity=0;db.stock_movements.push({id:uuid(),operation_id:key,operation_item_id:i.id,product_id:i.product_id,source_location_id:src,destination_location_id:dst,quantity:q,movement_type:type,created_at:stamp,created_by:db.profiles[0].id});});op.status='done';op.completed_at=stamp;persist();
+export async function signOut() {
+  checked(await client().auth.signOut(), 'Sign out failed');
+  authState.session = null;
+  authState.recovery = false;
+  clearData();
 }
+export async function requestPasswordReset(email) {
+  checked(await client().auth.resetPasswordForEmail(email, { redirectTo: `${location.origin}/reset-password` }), 'Password reset failed');
+}
+export async function resetPassword(password) {
+  if (!authState.session) throw new Error('Open a valid password reset link from your email first.');
+  checked(await client().auth.updateUser({ password }), 'Could not update password');
+  authState.recovery = false;
+  await refreshData();
+}
+async function refreshAfterMutation() {
+  try { await refreshData(); }
+  catch (error) {
+    // A successful write must not be retried just because its refresh failed.
+    window.dispatchEvent(new CustomEvent('stocksense-refresh-error', { detail: error.message }));
+  }
+}
+export async function loadAvailability(productId, locationId) {
+  if (!productId || !locationId) return;
+  const value = checked(await client().rpc('get_free_stock', { product_id: productId, location_id: locationId }), 'Could not check available stock');
+  if (value === null || !Number.isFinite(Number(value))) throw new Error('The free-stock function did not return a quantity.');
+  availability.set(`${productId}:${locationId}`, Number(value));
+  return Number(value);
+}
+export async function saveProduct(data, existing) {
+  const { initial_stock = 0, location_id, ...fields } = data;
+  if (!fields.name || !fields.sku || !fields.unit || !fields.category_id) throw new Error('Name, SKU, category and unit are required.');
+  if ([fields.cost, fields.minimum_stock, fields.reorder_quantity, initial_stock].some(n => !Number.isFinite(n) || n < 0)) throw new Error('Cost and stock quantities must be nonnegative numbers.');
+  if (!existing && initial_stock > 0 && get('locations', location_id)?.type !== 'internal') throw new Error('Choose an internal location for initial stock.');
+  const query = existing ? client().from('products').update(fields).eq('id', existing) : client().from('products').insert(fields);
+  const product = checked(await query.select().single(), 'Could not save product');
+  let warning = null;
+  if (!existing && initial_stock > 0) {
+    try {
+      const op = await saveOperation('adjustment', { source_location_id: idForType('adjustment'),
+        destination_location_id: location_id, contact_id: null, scheduled_date: new Date().toISOString(),
+        responsible_user_id: authState.session.user.id, notes: 'Initial stock' },
+      [{ product_id: product.id, counted_quantity: initial_stock }]);
+      await readyOperation(op.id);
+      await validateOperation(op.id);
+    } catch (error) { warning = `Product saved, but initial stock was not completed: ${error.message} Review Inventory Adjustments before retrying.`; }
+  }
+  await refreshAfterMutation();
+  return { id: product.id, warning };
+}
+export async function saveSetting(kind, fields) {
+  if (!['warehouses', 'locations'].includes(kind)) throw new Error('Invalid settings type.');
+  if (!fields.name || !fields.short_code) throw new Error('Name and short code are required.');
+  if (kind === 'locations' && fields.type === 'internal' && !fields.warehouse_id) throw new Error('Internal locations require a warehouse.');
+  checked(await client().from(kind).insert(fields).select().single(), 'Could not save '+kind.slice(0, -1));
+  await refreshAfterMutation();
+}
+function checkOperation(type, fields, lines) {
+  if (!authState.session || !authState.profile) throw new Error('Sign in with an inventory profile first.');
+  if (!lines.length) throw new Error('Add at least one product.');
+  if (new Set(lines.map(line => line.product_id)).size !== lines.length) throw new Error('Use one row per product; combine duplicate quantities.');
+  for (const line of lines) {
+    const quantity = type === 'adjustment' ? line.counted_quantity : line.requested_quantity;
+    if (!line.product_id || !Number.isFinite(quantity) || quantity < 0 || (type !== 'adjustment' && quantity === 0)) throw new Error('Enter a valid quantity for each product.');
+  }
+  const src = get('locations', fields.source_location_id), dst = get('locations', fields.destination_location_id);
+  if (!src || !dst || src.id === dst.id) throw new Error('Choose different source and destination locations.');
+  const allowed = { receipt: ['supplier', 'internal'], delivery: ['internal', 'customer'], transfer: ['internal', 'internal'], adjustment: ['adjustment', 'internal'] }[type];
+  if (!allowed || src.type !== allowed[0] || dst.type !== allowed[1]) throw new Error('Select valid locations for this operation.');
+  if (!fields.scheduled_date || !fields.responsible_user_id) throw new Error('Scheduled date and responsible person are required.');
+  if (['receipt', 'delivery'].includes(type) && !fields.contact_id) throw new Error('Choose a contact.');
+}
+export async function saveOperation(type, fields, lines, existing) {
+  checkOperation(type, fields, lines);
+  let operationId = existing;
+  const warehouseId = get('locations', ['receipt', 'adjustment'].includes(type) ? fields.destination_location_id : fields.source_location_id).warehouse_id;
+  const payload = { ...fields, warehouse_id: warehouseId };
+  let oldItems = [];
+  if (existing) {
+    const current = checked(await client().from('inventory_operations').select('*').eq('id', existing).single(), 'Could not load operation');
+    if (!['draft', 'waiting'].includes(current.status)) throw new Error('Only draft or waiting operations can be edited. Reload to see its current status.');
+    oldItems = checked(await client().from('inventory_operation_items').select('*').eq('operation_id', existing), 'Could not load product lines');
+    if (oldItems.some(item => Number(item.reserved_quantity) > 0)) throw new Error('This operation has reserved stock. Cancel it before changing its lines.');
+    checked(await client().from('inventory_operations').update(payload).eq('id', existing).in('status', ['draft', 'waiting']).select().single(), 'Could not save operation');
+  } else {
+    // Reference and timestamps are owned by the database, never generated here.
+    const created = checked(await client().from('inventory_operations').insert({ ...payload,
+      operation_type: type, status: 'draft', created_by: authState.session.user.id }).select().single(), 'Could not create operation');
+    operationId = created.id;
+  }
+  try {
+    const rows = lines.map(line => {
+      const old = oldItems.find(item => item.product_id === line.product_id);
+      return { ...(old ? { id: old.id } : {}), operation_id: operationId, product_id: line.product_id,
+        ...(type === 'adjustment' ? { counted_quantity: line.counted_quantity } : { requested_quantity: line.requested_quantity }) };
+    });
+    checked(await client().from('inventory_operation_items').upsert(rows, { onConflict: 'id', defaultToNull: false }).select(), 'Could not save product lines');
+    const removed = oldItems.filter(item => !lines.some(line => line.product_id === item.product_id)).map(item => item.id);
+    if (removed.length) checked(await client().from('inventory_operation_items').delete().eq('operation_id', operationId).in('id', removed), 'Could not remove product lines');
+  } catch (error) {
+    error.operationId = operationId;
+    error.message = `Operation saved, but its product lines need attention. ${error.message} Save again before preparing.`;
+    throw error;
+  }
+  let operation;
+  try {
+    operation = checked(await client().from('inventory_operations').select('*').eq('id', operationId).single(), 'Operation saved but could not reload it');
+  } catch (error) { error.operationId = operationId; throw error; }
+  await refreshAfterMutation();
+  return operation;
+}
+async function operationRpc(name, operationId) {
+  checked(await client().rpc(name, { operation_id: operationId }), 'Operation failed');
+  await refreshAfterMutation();
+  return checked(await client().from('inventory_operations').select('*').eq('id', operationId).single(), 'Operation updated but could not reload its status');
+}
+export async function readyOperation(operationId) {
+  const operation = await operationRpc('prepare_operation', operationId);
+  return operation.status === 'ready';
+}
+export const validateOperation = operationId => operationRpc('validate_operation', operationId);
+export const cancelOperation = operationId => operationRpc('cancel_operation', operationId);
